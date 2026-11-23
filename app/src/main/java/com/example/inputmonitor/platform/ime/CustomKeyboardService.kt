@@ -6,7 +6,6 @@ import android.text.InputType
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
-import android.view.inputmethod.InputMethodManager
 
 import com.example.inputmonitor.MonitoringApplication
 import com.example.inputmonitor.domain.model.EventSource
@@ -25,6 +24,90 @@ class CustomKeyboardService : InputMethodService() {
     private val keyProcessor = KeyProcessor()
     private val keyboardController = KeyboardController()
     private var keyboardView: KeyboardView? = null
+    private val languages by lazy {
+        runCatching { KeyboardLanguages.available() }.getOrDefault(listOf(KeyboardLanguages.english))
+    }
+    private var composer: TransliterationComposer? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        val preferences = getSharedPreferences("keyboard_language", MODE_PRIVATE)
+        val language = languages.firstOrNull { it.id == preferences.getString("language", "en") }
+            ?: KeyboardLanguages.english
+        selectLanguage(language, preferences.getBoolean("native", false))
+    }
+
+    private fun selectLanguage(language: KeyboardLanguage, native: Boolean) {
+        val transform = if (!native && language.transformId != null) runCatching {
+            android.icu.text.Transliterator.getInstance(language.transformId)
+        }.getOrNull() else null
+        if (!native && language.transformId != null && transform == null) {
+            android.widget.Toast.makeText(this, "This conversion is unavailable on this device.", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        composer?.finish(currentInputConnection)
+        typingSuggestions.close()
+        keyboardController.selectLanguage(language, native)
+        composer = transform?.let { converter ->
+            TransliterationComposer { text -> converter.transliterate(KeyboardLanguages.romanInput(text, language.transformId!!)) }
+        }
+        getSharedPreferences("keyboard_language", MODE_PRIVATE).edit()
+            .putString("language", language.id).putBoolean("native", native).apply()
+        if (language.id == "en") typingSuggestions.start(currentInputEditorInfo)
+        updateLanguageView()
+        keyboardView?.setLayout(keyboardController.currentLayout.value)
+    }
+
+    private fun englishSuggestionsAllowed(): Boolean = keyboardController.language.id == "en" &&
+        SuggestionPolicy.allows(currentInputEditorInfo?.inputType ?: 0, currentInputEditorInfo?.imeOptions ?: 0)
+
+    private fun updateLanguageView() {
+        val language = keyboardController.language
+        keyboardView?.apply {
+            languageLabel = if (keyboardController.editorAllowsLanguage) language.label else "English · This field"
+            languageOptions = languages.map { it.label }
+            languageModeLabel = if (language.id == "en" || !keyboardController.editorAllowsLanguage) ""
+                else if (keyboardController.nativeMode) "Native keys" else if (language.transformId == null) "ABC" else "ABC → Script"
+            val pages = ((KeyboardLanguages.nativeCharacters(language).size + 23) / 24).coerceAtLeast(1)
+            languagePageLabel = if (keyboardController.nativeMode && keyboardController.editorAllowsLanguage && pages > 1)
+                "${keyboardController.languagePage + 1}/$pages" else ""
+            onLanguageSelected = { index ->
+                languages.getOrNull(index)?.let { selected ->
+                    selectLanguage(selected, selected.id != "en" && (selected.transformId == null || keyboardController.nativeMode))
+                }
+            }
+            onToggleLanguageMode = { selectLanguage(language, !keyboardController.nativeMode) }
+            onNextLanguagePage = {
+                composer?.finish(currentInputConnection)
+                keyboardController.nextLanguagePage()
+                updateLanguageView()
+                setLayout(keyboardController.currentLayout.value)
+            }
+            setSuggestionsAllowed(englishSuggestionsAllowed())
+        }
+    }
+    private data class PendingMedia(val uri: android.net.Uri, val mime: String,
+        val editorPackage: String?, val field: Int?)
+    private var pendingMedia: PendingMedia? = null
+
+    private fun deliverPendingMedia() {
+        val media = pendingMedia ?: return
+        pendingMedia = null
+        val info = currentInputEditorInfo
+        val supported = info?.contentMimeTypes.orEmpty().any {
+            android.content.ClipDescription.compareMimeTypes(media.mime, it)
+        }
+        val sent = if (info?.packageName == media.editorPackage && info?.fieldId == media.field && supported) {
+            runCatching {
+                currentInputConnection?.commitContent(android.view.inputmethod.InputContentInfo(media.uri,
+                    android.content.ClipDescription("Keyboard media", arrayOf(media.mime)), null),
+                    InputConnection.INPUT_CONTENT_GRANT_READ_URI_PERMISSION, null) == true
+            }.getOrDefault(false)
+        } else false
+        if (!sent) android.widget.Toast.makeText(this,
+            "This field does not support this media. Try a messaging attachment field.",
+            android.widget.Toast.LENGTH_LONG).show()
+    }
     private val typingSuggestions by lazy {
         TypingSuggestions(this, { currentInputConnection }) { keyboardView?.setSuggestions(it) }
     }
@@ -64,18 +147,31 @@ class CustomKeyboardService : InputMethodService() {
         val view = KeyboardView(this) { action ->
             handleKeyAction(action)
         }
-        view.setLayout(keyboardController.currentLayout.value)
         keyboardView = view
-        view.setSuggestionsAllowed(SuggestionPolicy.allows(currentInputEditorInfo?.inputType ?: 0, currentInputEditorInfo?.imeOptions ?: 0))
+        updateLanguageView()
+        view.setLayout(keyboardController.currentLayout.value)
+        view.onMedia = { mime ->
+            val editorPackage = currentInputEditorInfo?.packageName
+            val editorField = currentInputEditorInfo?.fieldId
+            KeyboardMediaActivity.deliver = { uri, actualMime ->
+                pendingMedia = PendingMedia(uri, actualMime, editorPackage, editorField)
+            }
+            startActivity(android.content.Intent(this, KeyboardMediaActivity::class.java)
+                .putExtra("mime", mime).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+        }
         view.onSuggestion = { runCatching { typingSuggestions.choose(it) }; Unit }
         return view
     }
 
     override fun onStartInput(attribute: EditorInfo?, restarting: Boolean) {
+        composer?.reset()
+        keyboardView?.stopRepeatingDelete()
         super.onStartInput(attribute, restarting)
         keyboardController.updateEditorInfo(attribute)
-        runCatching { typingSuggestions.start(attribute) }
-        keyboardView?.setSuggestionsAllowed(SuggestionPolicy.allows(attribute?.inputType ?: 0, attribute?.imeOptions ?: 0))
+        runCatching {
+            if (keyboardController.language.id == "en") typingSuggestions.start(attribute) else typingSuggestions.close()
+        }
+        updateLanguageView()
     }
 
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
@@ -83,17 +179,35 @@ class CustomKeyboardService : InputMethodService() {
         keyboardController.updateEditorInfo(info)
         // Android may recreate the IME window independently of the editor session.
         val view = keyboardView ?: (onCreateInputView() as KeyboardView).also { setInputView(it) }
+        updateLanguageView()
         view.startInput(keyboardController.currentLayout.value)
-        view.setSuggestionsAllowed(SuggestionPolicy.allows(info?.inputType ?: 0, info?.imeOptions ?: 0))
         runCatching { typingSuggestions.refresh() }
+        deliverPendingMedia()
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
+        composer?.finish(currentInputConnection)
+        keyboardView?.stopRepeatingDelete()
         super.onFinishInputView(finishingInput)
         keyboardController.setShift(ShiftState.OFF)
     }
 
     internal fun handleKeyAction(action: KeyAction) {
+        if (keyboardController.editorAllowsLanguage && composer != null) {
+            val consumed = when (action) {
+                is KeyAction.Character -> composer?.character(action.text, currentInputConnection) == true
+                KeyAction.Backspace -> composer?.backspace(currentInputConnection) == true
+                else -> false
+            }
+            if (consumed) {
+                if (action is KeyAction.Character && keyboardController.shiftState == ShiftState.ON_ONCE) {
+                    keyboardController.onCharacterTyped()
+                    keyboardView?.setLayout(keyboardController.currentLayout.value)
+                }
+                return
+            }
+            if (action != KeyAction.Shift) composer?.finish(currentInputConnection)
+        }
         // Step 1: Input delivery to target app via InputConnection ALWAYS executes first
         when (action) {
             is KeyAction.Shift -> {
@@ -101,8 +215,7 @@ class CustomKeyboardService : InputMethodService() {
                 keyboardView?.setLayout(keyboardController.currentLayout.value)
             }
             is KeyAction.SwitchIme -> {
-                val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-                imm?.showInputMethodPicker()
+                keyboardView?.showLanguagePicker()
             }
             is KeyAction.SwitchLayout -> {
                 keyboardController.switchLayout(action.target)
@@ -168,12 +281,18 @@ class CustomKeyboardService : InputMethodService() {
     }
 
     override fun onDestroy() {
+        composer?.reset()
+        keyboardView?.stopRepeatingDelete()
+        KeyboardMediaActivity.deliver = null
+        pendingMedia = null
         typingSuggestions.close()
         keyboardView = null
         super.onDestroy()
     }
 
     override fun onFinishInput() {
+        composer?.reset()
+        keyboardView?.stopRepeatingDelete()
         typingSuggestions.close()
         super.onFinishInput()
     }
@@ -181,6 +300,9 @@ class CustomKeyboardService : InputMethodService() {
     override fun onUpdateSelection(oldSelStart: Int, oldSelEnd: Int, newSelStart: Int,
         newSelEnd: Int, candidatesStart: Int, candidatesEnd: Int) {
         super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
+        if (composer?.active == true && (newSelStart != candidatesEnd || newSelEnd != candidatesEnd)) {
+            composer?.finish(currentInputConnection)
+        }
         runCatching { typingSuggestions.refresh() }
     }
 }

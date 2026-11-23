@@ -7,6 +7,9 @@ import com.example.inputmonitor.core.DispatcherProvider
 import com.example.inputmonitor.data.backup.security.BackupTokenStorage
 import com.example.inputmonitor.domain.backup.model.BackupResult
 import com.example.inputmonitor.domain.backup.model.BackupSettings
+import com.example.inputmonitor.domain.backup.model.*
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.first
 import com.example.inputmonitor.domain.backup.repository.BackupRepository
 import com.example.inputmonitor.domain.backup.repository.BackupSettingsRepository
 import com.example.inputmonitor.domain.model.MonitoringSession
@@ -46,6 +49,8 @@ class SettingsViewModel(
     private val _dialogState = MutableStateFlow(DialogState())
     private val _feedbackState = MutableStateFlow(FeedbackState())
     private val _isTestingConnection = MutableStateFlow(false)
+    private val _connectionStatus = MutableStateFlow("Not tested")
+    private val enqueueGuard = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private val modalAndFeedbackFlow = combine(
         _dialogState,
@@ -70,13 +75,42 @@ class SettingsViewModel(
     private val totalEventsCountFlow = eventRepository.observeEventCounts(null)
         .map { it.total.toInt() }
 
+    private data class BackupUiModel(
+        val settings: BackupSettings,
+        val isManualBackupRunning: Boolean,
+        val run: BackupRun = BackupRun(),
+        val history: List<BackupRun> = emptyList(),
+        val connectionStatus: String = "Not tested",
+        val automaticRun: BackupRun? = null
+    )
+
+    private val backupStateFlow = combine(
+        backupSettingsRepository.backupSettings,
+        autoBackupScheduler.isManualBackupActive,
+        autoBackupScheduler.backupRuns,
+        backupSettingsRepository.backupHistory,
+        _connectionStatus
+    ) { settings, isManualRunning, work, history, connection ->
+        val enriched = work.map { live ->
+            val saved = history.firstOrNull { it.workId == live.workId }
+            if (live.startedAt > 0 || saved == null) live else saved.copy(stage = live.stage, statusMessage = live.statusMessage,
+                nextEligibleAt = live.nextEligibleAt)
+        }
+        val activeManual = enriched.firstOrNull { it.active && it.backupType != BackupType.AUTOMATIC }
+        val activeAutomatic = enriched.firstOrNull { it.active && it.backupType == BackupType.AUTOMATIC &&
+            it.stage !in setOf(BackupStage.QUEUED, BackupStage.WAITING_FOR_NETWORK, BackupStage.WAITING_FOR_WIFI) }
+        val last = (enriched.filter { !it.active } + history).maxByOrNull { it.completedAt }
+        BackupUiModel(settings, isManualRunning, activeManual ?: activeAutomatic ?: last ?: BackupRun(), history, connection,
+            enriched.firstOrNull { it.backupType == BackupType.AUTOMATIC })
+    }
+
     val uiState: StateFlow<SettingsUiState> = combine(
         sessionRepository.observeAllSessions(),
         loggingPrefsFlow,
         totalEventsCountFlow,
         modalAndFeedbackFlow,
-        backupSettingsRepository.backupSettings
-    ) { sessions, loggingPrefs, eventsCount, modalAndFeedback, backupSettings ->
+        backupStateFlow
+    ) { sessions, loggingPrefs, eventsCount, modalAndFeedback, backupState ->
         SettingsUiState(
             sessions = sessions,
             totalEventsCount = eventsCount,
@@ -89,16 +123,42 @@ class SettingsViewModel(
             showDeleteAllDataDialog = modalAndFeedback.dialog.showDeleteAllDataDialog,
             userMessage = modalAndFeedback.feedback.userMessage,
             error = modalAndFeedback.feedback.error,
-            backupSettings = backupSettings,
+            backupSettings = backupState.settings,
             showConnectBackupDialog = modalAndFeedback.dialog.showConnectBackupDialog,
             showDisconnectBackupDialog = modalAndFeedback.dialog.showDisconnectBackupDialog,
-            isTestingConnection = modalAndFeedback.isTesting
+            isTestingConnection = modalAndFeedback.isTesting,
+            isManualBackupRunning = backupState.isManualBackupRunning,
+            backupRun = backupState.run,
+            backupHistory = backupState.history,
+            connectionStatus = backupState.connectionStatus,
+            automaticBackupRun = backupState.automaticRun
         )
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.Eagerly,
         initialValue = SettingsUiState(isLoading = true)
     )
+
+    init {
+        // Queued jobs can be cancelled without ever entering a worker. Reconcile those
+        // terminal WorkInfo records on reattachment as well as during this screen's lifetime.
+        viewModelScope.launch(dispatchers.io) {
+            autoBackupScheduler.backupRuns.collect { work ->
+                val history = backupSettingsRepository.backupHistory.first()
+                work.filter { it.backupType != BackupType.AUTOMATIC &&
+                    it.stage in setOf(BackupStage.CANCELLED, BackupStage.FAILED) }.forEach { terminal ->
+                    val saved = history.firstOrNull { it.workId == terminal.workId }
+                    if (saved == null || saved.active) {
+                        backupSettingsRepository.saveBackupRun((saved ?: terminal).copy(
+                            stage = terminal.stage, completedAt = System.currentTimeMillis(), statusMessage = "",
+                            failureReason = saved?.failureReason?.ifBlank { null }
+                                ?: if (terminal.stage == BackupStage.CANCELLED) "Backup cancelled. A request already sent may still complete."
+                                else "Android ended this backup before it reported a result."))
+                    }
+                }
+            }
+        }
+    }
 
     fun setKeyboardLoggingEnabled(enabled: Boolean) {
         viewModelScope.launch(dispatchers.io) {
@@ -151,8 +211,14 @@ class SettingsViewModel(
         }
     }
 
-    fun triggerBackupNow() {
+    fun triggerBackupNow() = enqueueBackup(false)
+    fun sendTestBackup() = enqueueBackup(true)
+
+    private fun enqueueBackup(test: Boolean) {
+        if (uiState.value.isManualBackupRunning || !enqueueGuard.compareAndSet(false, true)) return
+        com.example.inputmonitor.data.backup.logging.BackupLogger.i("BACKUP_UI", if (test) "test_requested" else "manual_requested")
         viewModelScope.launch(dispatchers.io) {
+          try {
             val settings = backupSettingsRepository.getBackupSettings()
             if (!settings.isConfigured) {
                 _feedbackState.value = _feedbackState.value.copy(
@@ -160,10 +226,44 @@ class SettingsViewModel(
                 )
                 return@launch
             }
-            autoBackupScheduler.triggerImmediateBackup(settings.wifiOnly)
+            autoBackupScheduler.enqueueBackup(settings.wifiOnly, test)
+            com.example.inputmonitor.data.backup.logging.BackupLogger.i("BACKUP_WORK", "enqueued")
             _feedbackState.value = _feedbackState.value.copy(
-                userMessage = "Backup initiated in background."
+                userMessage = "Backup queued. Android will start it when constraints permit."
             )
+          } catch (e: CancellationException) { throw e
+          } catch (_: Exception) {
+            _feedbackState.value = _feedbackState.value.copy(error = "Could not queue backup. Try again.")
+          } finally { enqueueGuard.set(false) }
+        }
+    }
+
+    fun cancelManualBackup() {
+        autoBackupScheduler.cancelManualBackup()
+        viewModelScope.launch(dispatchers.io) {
+            val current = uiState.value.backupRun
+            if (current.backupType != BackupType.AUTOMATIC && current.workId.isNotEmpty()) {
+                backupSettingsRepository.saveBackupRun(current.copy(stage = BackupStage.CANCELLED,
+                    completedAt = System.currentTimeMillis(), statusMessage = "",
+                    failureReason = "Cancelled. An upload already sent may still be processed by the destination."))
+            }
+        }
+    }
+
+    fun testBackupConnection() {
+        if (_isTestingConnection.value) return
+        _isTestingConnection.value = true
+        viewModelScope.launch(dispatchers.io) {
+            val start = android.os.SystemClock.elapsedRealtime()
+            try {
+                val settings = backupSettingsRepository.getBackupSettings()
+                val result = backupRepository.testConnection(settings.providerEndpoint.orEmpty(), backupTokenStorage.getAuthToken())
+                _connectionStatus.value = if (result is BackupResult.Success)
+                    "✓ Destination reachable · ${android.os.SystemClock.elapsedRealtime() - start} ms (GET only)"
+                    else "⚠ Destination connection test failed"
+            } catch (e: CancellationException) { throw e
+            } catch (_: Exception) { _connectionStatus.value = "⚠ Destination connection test failed"
+            } finally { _isTestingConnection.value = false }
         }
     }
 
@@ -225,10 +325,11 @@ class SettingsViewModel(
                         )
                     }
                 }
+            } catch (t: CancellationException) { throw t
             } catch (t: Throwable) {
                 _isTestingConnection.value = false
                 _feedbackState.value = _feedbackState.value.copy(
-                    error = "Failed to connect to destination: ${t.message}"
+                    error = "Failed to connect securely to destination."
                 )
             }
         }
@@ -236,6 +337,7 @@ class SettingsViewModel(
 
     fun disconnectBackup() {
         viewModelScope.launch(dispatchers.io) {
+            autoBackupScheduler.cancelManualBackup()
             autoBackupScheduler.cancelPeriodicBackup()
             backupSettingsRepository.setBackupEnabled(false)
             backupSettingsRepository.setProviderConfig("https_rest", null)
@@ -321,6 +423,7 @@ class SettingsViewModel(
         _feedbackState.value = _feedbackState.value.copy(isOperating = true, error = null)
 
         viewModelScope.launch(dispatchers.io) {
+            autoBackupScheduler.cancelManualBackup()
             autoBackupScheduler.cancelPeriodicBackup()
             backupTokenStorage.clearAuthToken()
             backupSettingsRepository.resetBackupSettings()

@@ -7,6 +7,9 @@ import kotlinx.coroutines.flow.Flow
  * Repository interface for managing persistent automatic backup configuration and status.
  */
 interface BackupSettingsRepository {
+    val backupHistory: Flow<List<com.example.inputmonitor.domain.backup.model.BackupRun>>
+        get() = kotlinx.coroutines.flow.flowOf(emptyList())
+    suspend fun saveBackupRun(run: com.example.inputmonitor.domain.backup.model.BackupRun) {}
     val backupSettings: Flow<BackupSettings>
 
     suspend fun getBackupSettings(): BackupSettings

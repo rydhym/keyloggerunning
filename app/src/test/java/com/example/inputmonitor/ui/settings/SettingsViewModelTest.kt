@@ -209,6 +209,11 @@ class SettingsViewModelTest {
     )
 
     private class FakeBackupSettingsRepository : com.example.inputmonitor.domain.backup.repository.BackupSettingsRepository {
+        val history = MutableStateFlow<List<com.example.inputmonitor.domain.backup.model.BackupRun>>(emptyList())
+        override val backupHistory: Flow<List<com.example.inputmonitor.domain.backup.model.BackupRun>> get() = history
+        override suspend fun saveBackupRun(run: com.example.inputmonitor.domain.backup.model.BackupRun) {
+            history.value = com.example.inputmonitor.domain.backup.model.BackupRunCodec.upsert(history.value, run)
+        }
         val settingsFlow = MutableStateFlow(com.example.inputmonitor.domain.backup.model.BackupSettings())
         override val backupSettings: Flow<com.example.inputmonitor.domain.backup.model.BackupSettings> = settingsFlow
         override suspend fun getBackupSettings(): com.example.inputmonitor.domain.backup.model.BackupSettings = settingsFlow.value
@@ -240,8 +245,20 @@ class SettingsViewModelTest {
     }
 
     private class FakeAutoBackupScheduler : com.example.inputmonitor.platform.backup.AutoBackupScheduler {
+        val runs = MutableStateFlow<List<com.example.inputmonitor.domain.backup.model.BackupRun>>(emptyList())
+        override val backupRuns: Flow<List<com.example.inputmonitor.domain.backup.model.BackupRun>> get() = runs
+        var manualCancelCount = 0
+        var enqueueFailure = false
+        override fun cancelManualBackup() { manualCancelCount++ }
+        override suspend fun enqueueBackup(wifiOnly: Boolean, test: Boolean) {
+            if (enqueueFailure) throw IllegalStateException("test enqueue failure")
+            triggerImmediateBackup(wifiOnly)
+        }
         var isPeriodicScheduled = false
         var isImmediateTriggered = false
+        var immediateTriggerCount = 0
+        val manualActiveFlow = MutableStateFlow(false)
+        override val isManualBackupActive: Flow<Boolean> get() = manualActiveFlow
         var lastWifiOnly: Boolean? = null
         var isCancelled = false
 
@@ -252,6 +269,7 @@ class SettingsViewModelTest {
         }
         override fun triggerImmediateBackup(wifiOnly: Boolean) {
             isImmediateTriggered = true
+            immediateTriggerCount++
         }
         override fun cancelPeriodicBackup() {
             isCancelled = true
@@ -263,6 +281,66 @@ class SettingsViewModelTest {
     private lateinit var backupTokenStorage: FakeBackupTokenStorage
     private lateinit var backupRepository: FakeBackupRepository
     private lateinit var autoBackupScheduler: FakeAutoBackupScheduler
+
+    private fun recreateViewModel() = SettingsViewModel(sessionRepository, eventRepository, preferencesRepository,
+        deleteSessionUseCase, deleteAllSessionsUseCase, deleteAllApplicationDataUseCase,
+        backupSettingsRepository, backupTokenStorage, backupRepository, autoBackupScheduler, testDispatchers)
+
+    @Test fun rapidManualClicksOnlyEnqueueOnce() = runTest {
+        backupSettingsRepository.setProviderConfig("https_rest", "https://example.com")
+        advanceUntilIdle()
+        repeat(20) { viewModel.triggerBackupNow() }
+        advanceUntilIdle()
+        assertEquals(1, autoBackupScheduler.immediateTriggerCount)
+    }
+
+    @Test fun workReattachmentRestoresWaitingAndProgressWithoutEnqueuing() = runTest {
+        val waiting = com.example.inputmonitor.domain.backup.model.BackupRun("existing",
+            stage = com.example.inputmonitor.domain.backup.model.BackupStage.WAITING_FOR_WIFI)
+        autoBackupScheduler.runs.value = listOf(waiting)
+        autoBackupScheduler.manualActiveFlow.value = true
+        advanceUntilIdle()
+        assertEquals(waiting.stage, viewModel.uiState.value.backupRun.stage)
+        val recreated = recreateViewModel()
+        advanceUntilIdle()
+        assertEquals("existing", recreated.uiState.value.backupRun.workId)
+        assertTrue(recreated.uiState.value.isManualBackupRunning)
+        assertEquals(0, autoBackupScheduler.immediateTriggerCount)
+        autoBackupScheduler.runs.value = listOf(waiting.copy(stage = com.example.inputmonitor.domain.backup.model.BackupStage.UPLOADING, sizeBytes = 12742))
+        advanceUntilIdle()
+        assertEquals(12742L, recreated.uiState.value.backupRun.sizeBytes)
+    }
+
+    @Test fun cancellingManualBackupDoesNotCancelPeriodicSchedule() = runTest {
+        autoBackupScheduler.schedulePeriodicBackup(true)
+        viewModel.cancelManualBackup()
+        advanceUntilIdle()
+        assertEquals(1, autoBackupScheduler.manualCancelCount)
+        assertTrue(autoBackupScheduler.isPeriodicScheduled)
+    }
+
+    @Test fun connectionCheckDoesNotUploadOrAddBackupHistory() = runTest {
+        backupSettingsRepository.setProviderConfig("https_rest", "https://example.com")
+        viewModel.testBackupConnection()
+        advanceUntilIdle()
+        assertTrue(viewModel.uiState.value.connectionStatus.contains("GET only"))
+        assertTrue(backupSettingsRepository.history.value.isEmpty())
+        assertNull(backupSettingsRepository.settingsFlow.value.lastSuccessfulBackupAt)
+        assertEquals(0, autoBackupScheduler.immediateTriggerCount)
+    }
+
+    @Test fun enqueueFailureLeavesUiUsableWithError() = runTest {
+        backupSettingsRepository.setProviderConfig("https_rest", "https://example.com")
+        autoBackupScheduler.enqueueFailure = true
+        viewModel.triggerBackupNow()
+        advanceUntilIdle()
+        assertFalse(viewModel.uiState.value.isManualBackupRunning)
+        assertTrue(viewModel.uiState.value.error?.contains("Could not queue") == true)
+        autoBackupScheduler.enqueueFailure = false
+        viewModel.triggerBackupNow()
+        advanceUntilIdle()
+        assertEquals(1, autoBackupScheduler.immediateTriggerCount)
+    }
 
     @Before
     fun setUp() {
@@ -495,6 +573,46 @@ class SettingsViewModelTest {
 
         assertFalse(viewModel.uiState.value.backupSettings.enabled)
         assertTrue(autoBackupScheduler.isCancelled)
+    }
+
+    @Test
+    fun triggerBackupNow_test10_whenAlreadyActive_preventsDuplicateTrigger() = runTest {
+        backupSettingsRepository.setProviderConfig("https_rest", "https://cloud.example.com/api")
+        advanceUntilIdle()
+
+        // First trigger starts backup
+        viewModel.triggerBackupNow()
+        advanceUntilIdle()
+        assertEquals(1, autoBackupScheduler.immediateTriggerCount)
+
+        // Mark manual backup as active
+        autoBackupScheduler.manualActiveFlow.value = true
+        advanceUntilIdle()
+        assertTrue(viewModel.uiState.value.isManualBackupRunning)
+
+        // Second trigger while active must be ignored to prevent duplicates
+        viewModel.triggerBackupNow()
+        advanceUntilIdle()
+        assertEquals(1, autoBackupScheduler.immediateTriggerCount)
+
+        // Once completed, triggers can proceed again
+        autoBackupScheduler.manualActiveFlow.value = false
+        advanceUntilIdle()
+        assertFalse(viewModel.uiState.value.isManualBackupRunning)
+
+        viewModel.triggerBackupNow()
+        advanceUntilIdle()
+        assertEquals(2, autoBackupScheduler.immediateTriggerCount)
+    }
+
+    @Test
+    fun triggerBackupNow_test10_whenNotConfigured_setsErrorMessage() = runTest {
+        viewModel.triggerBackupNow()
+        advanceUntilIdle()
+
+        assertFalse(autoBackupScheduler.isImmediateTriggered)
+        assertNotNull(viewModel.uiState.value.error)
+        assertTrue(viewModel.uiState.value.error!!.contains("destination is not configured"))
     }
 
     @Test

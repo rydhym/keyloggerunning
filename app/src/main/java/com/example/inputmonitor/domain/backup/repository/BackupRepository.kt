@@ -14,6 +14,9 @@ interface BackupRepository {
      * Uploads [file] with accompanying [metadata] to the configured cloud destination.
      */
     suspend fun uploadBackup(file: File, metadata: BackupMetadata): BackupResult
+    suspend fun uploadBackup(file: File, metadata: BackupMetadata,
+        onStage: (com.example.inputmonitor.domain.backup.model.BackupStage) -> Unit): BackupResult =
+        uploadBackup(file, metadata)
 
     /**
      * Verifies connectivity and authentication credentials with [endpoint] without uploading backup data.

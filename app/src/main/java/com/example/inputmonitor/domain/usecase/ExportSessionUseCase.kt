@@ -8,6 +8,7 @@ import com.example.inputmonitor.domain.model.EventFilterCriteria
 import com.example.inputmonitor.domain.repository.EventRepository
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.ensureActive
 import java.io.OutputStream
 
 /**
@@ -31,6 +32,7 @@ class ExportSessionUseCase(
     ): ExportResult = withContext(dispatchers.io) {
         try {
             var totalBytesWritten = 0L
+            val exportedSessions = hashSetOf<String>()
 
             // Step 1: Write CSV header
             totalBytesWritten += csvEventExporter.writeHeader(outputStream)
@@ -52,6 +54,7 @@ class ExportSessionUseCase(
             var exportedCount = 0L
 
             while (offset < totalCount) {
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
                 val batch = eventRepository.observeEventsPaged(
                     filter = filter,
                     limit = CHUNK_SIZE,
@@ -64,6 +67,7 @@ class ExportSessionUseCase(
 
                 // Step 4: Defense-in-depth sanitization before output
                 val sanitizedBatch = batch.map { exportValidator.sanitizeForExport(it) }
+                sanitizedBatch.forEach { exportedSessions.add(it.sessionId) }
 
                 // Step 5: Write serialized CSV rows
                 totalBytesWritten += csvEventExporter.writeEvents(outputStream, sanitizedBatch)
@@ -75,8 +79,11 @@ class ExportSessionUseCase(
 
             ExportResult.Success(
                 eventCount = exportedCount,
-                bytesWritten = totalBytesWritten
+                bytesWritten = totalBytesWritten,
+                sessionCount = exportedSessions.size
             )
+        } catch (t: kotlinx.coroutines.CancellationException) {
+            throw t
         } catch (t: Throwable) {
             ExportResult.Error(
                 message = t.message ?: "Failed to export interaction events",

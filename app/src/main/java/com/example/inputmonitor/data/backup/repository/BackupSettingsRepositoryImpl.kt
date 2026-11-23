@@ -10,6 +10,8 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.inputmonitor.core.DispatcherProvider
 import com.example.inputmonitor.domain.backup.model.BackupSettings
+import com.example.inputmonitor.domain.backup.model.BackupRun
+import com.example.inputmonitor.domain.backup.model.BackupRunCodec
 import com.example.inputmonitor.domain.backup.repository.BackupSettingsRepository
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -34,6 +36,7 @@ class BackupSettingsRepositoryImpl(
         get() = customDataStore ?: context.backupDataStore
 
     companion object {
+        private val KEY_HISTORY = stringPreferencesKey("backup_history_v1")
         private val KEY_BACKUP_ENABLED = booleanPreferencesKey("backup_enabled")
         private val KEY_PROVIDER_ID = stringPreferencesKey("provider_id")
         private val KEY_PROVIDER_ENDPOINT = stringPreferencesKey("provider_endpoint")
@@ -43,6 +46,16 @@ class BackupSettingsRepositoryImpl(
         private val KEY_LAST_FAILURE_REASON = stringPreferencesKey("last_failure_reason")
         private val KEY_LAST_REMOTE_BACKUP_ID = stringPreferencesKey("last_remote_backup_id")
         private val KEY_AUTH_REQUIRED = booleanPreferencesKey("is_auth_required")
+    }
+
+    override val backupHistory: Flow<List<BackupRun>> = dataStore.data.map {
+        BackupRunCodec.decode(it[KEY_HISTORY])
+    }.flowOn(dispatchers.io)
+
+    override suspend fun saveBackupRun(run: BackupRun) {
+        dataStore.edit { prefs ->
+            prefs[KEY_HISTORY] = BackupRunCodec.encode(BackupRunCodec.upsert(BackupRunCodec.decode(prefs[KEY_HISTORY]), run))
+        }
     }
 
     override val backupSettings: Flow<BackupSettings> = dataStore.data

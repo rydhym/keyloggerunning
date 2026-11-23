@@ -26,6 +26,32 @@ class KeyboardController(
         get() = _layoutType
 
     private var _enterLabel = "↵"
+    var language: KeyboardLanguage = KeyboardLanguages.english
+        private set
+    var nativeMode: Boolean = false
+        private set
+    var languagePage: Int = 0
+        private set
+    var editorAllowsLanguage: Boolean = false
+        private set
+
+    fun selectLanguage(value: KeyboardLanguage, native: Boolean) {
+        language = value
+        nativeMode = native
+        languagePage = 0
+        if (editorAllowsLanguage) {
+            _layoutType = KeyboardLayoutType.QWERTY
+            _shiftState = ShiftState.OFF
+            lastShiftTapTime = 0L
+        }
+        refreshLayout()
+    }
+
+    fun nextLanguagePage() {
+        val count = ((KeyboardLanguages.nativeCharacters(language).size + 23) / 24).coerceAtLeast(1)
+        languagePage = (languagePage + 1) % count
+        refreshLayout()
+    }
     val enterLabel: String
         get() = _enterLabel
 
@@ -93,6 +119,7 @@ class KeyboardController(
      * and action key labels (Go, Search, Send, Next, Done, etc.) via [EditorInfoAnalyzer].
      */
     fun updateEditorInfo(editorInfo: EditorInfo?) {
+        editorAllowsLanguage = SuggestionPolicy.allows(editorInfo?.inputType ?: 0, editorInfo?.imeOptions ?: 0)
         val context = editorInfoAnalyzer.analyze(editorInfo)
         _currentEditorContext = context
 
@@ -115,7 +142,7 @@ class KeyboardController(
     }
 
     private fun createCurrentLayout(): KeyboardLayout {
-        return when (_layoutType) {
+        val base = when (_layoutType) {
             KeyboardLayoutType.QWERTY,
             KeyboardLayoutType.EMAIL,
             KeyboardLayoutType.URI -> {
@@ -138,5 +165,9 @@ class KeyboardController(
                 KeyboardLayout.createPhoneLayout(enterLabel = _enterLabel)
             }
         }
+        return if (editorAllowsLanguage && nativeMode && language.ranges.isNotEmpty() &&
+            _layoutType == KeyboardLayoutType.QWERTY) {
+            KeyboardLanguages.nativeLayout(base, language, languagePage, _shiftState.isShifted)
+        } else base
     }
 }

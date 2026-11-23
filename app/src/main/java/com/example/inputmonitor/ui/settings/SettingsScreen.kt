@@ -84,6 +84,9 @@ fun SettingsScreen(
     onAutomaticBackupToggle: (Boolean) -> Unit = {},
     onWifiOnlyToggle: (Boolean) -> Unit = {},
     onTriggerBackupNow: () -> Unit = {},
+    onSendTestBackup: () -> Unit = {},
+    onTestBackupConnection: () -> Unit = {},
+    onCancelManualBackup: () -> Unit = {},
     onRequestConnectBackup: () -> Unit = {},
     onDismissConnectBackupDialog: () -> Unit = {},
     onConfirmConnectBackup: (String, String?) -> Unit = { _, _ -> },
@@ -154,12 +157,14 @@ fun SettingsScreen(
                 )
 
                 // Section 3: Automatic Daily Cloud Backup (Phase 13)
-                AutomaticBackupCard(
-                    backupSettings = uiState.backupSettings,
-                    isBackupConfigured = uiState.isBackupConfigured,
+                BackupStatusCard(
+                    uiState = uiState,
                     onAutomaticBackupToggle = onAutomaticBackupToggle,
                     onWifiOnlyToggle = onWifiOnlyToggle,
                     onTriggerBackupNow = onTriggerBackupNow,
+                    onSendTestBackup = onSendTestBackup,
+                    onTestConnection = onTestBackupConnection,
+                    onCancel = onCancelManualBackup,
                     onRequestConnectBackup = onRequestConnectBackup,
                     onRequestDisconnectBackup = onRequestDisconnectBackup
                 )
@@ -384,7 +389,7 @@ private fun StorageOverviewCard(
                     modifier = Modifier.size(16.dp)
                 )
                 Text(
-                    text = "Encrypted at rest via SQLCipher (AES-256). Strictly zero network transmission.",
+                    text = "Encrypted at rest via SQLCipher (AES-256). Cloud backup transmits CSV over HTTPS only when you configure it.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -666,194 +671,6 @@ private fun DangerZoneCard(
 }
 
 @Composable
-private fun AutomaticBackupCard(
-    backupSettings: BackupSettings,
-    isBackupConfigured: Boolean,
-    onAutomaticBackupToggle: (Boolean) -> Unit,
-    onWifiOnlyToggle: (Boolean) -> Unit,
-    onTriggerBackupNow: () -> Unit,
-    onRequestConnectBackup: () -> Unit,
-    onRequestDisconnectBackup: () -> Unit
-) {
-    val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()) }
-
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Lock,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(20.dp)
-                )
-                Text(
-                    text = "AUTOMATIC DAILY BACKUP",
-                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
-                    color = MaterialTheme.colorScheme.primary
-                )
-            }
-
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                text = "Automatically exports and uploads encrypted CSV backups approximately every 24 hours to your authenticated cloud destination.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-
-            Spacer(modifier = Modifier.height(14.dp))
-
-            // Switch 1: Enable Automatic Daily Backup
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "Automatic Daily Backup",
-                        style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Medium)
-                    )
-                    Text(
-                        text = if (backupSettings.enabled) "Enabled (Runs approx. daily)" else "Disabled (Manual export only)",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                Switch(
-                    checked = backupSettings.enabled,
-                    onCheckedChange = onAutomaticBackupToggle
-                )
-            }
-
-            HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
-
-            // Switch 2: Wi-Fi Only
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "Wi-Fi Only",
-                        style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Medium)
-                    )
-                    Text(
-                        text = if (backupSettings.wifiOnly) "Upload only over unmetered Wi-Fi" else "Upload over Wi-Fi or mobile data",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                Switch(
-                    checked = backupSettings.wifiOnly,
-                    onCheckedChange = onWifiOnlyToggle
-                )
-            }
-
-            HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
-
-            // Cloud Destination Status
-            Text(
-                text = "DESTINATION & STATUS",
-                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Spacer(modifier = Modifier.height(6.dp))
-
-            Text(
-                text = if (isBackupConfigured) "Connected: ${backupSettings.providerEndpoint}" else "Status: Not configured",
-                style = MaterialTheme.typography.bodyMedium,
-                fontWeight = FontWeight.Medium
-            )
-
-            val lastSuccessText = backupSettings.lastSuccessfulBackupAt?.let {
-                dateFormat.format(Date(it))
-            } ?: "Never"
-            Text(
-                text = "Last successful backup: $lastSuccessText",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-
-            // Warning if authentication required or failed
-            if (backupSettings.isAuthenticationRequired) {
-                Spacer(modifier = Modifier.height(8.dp))
-                Surface(
-                    shape = RoundedCornerShape(8.dp),
-                    color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.6f)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Warning,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.error,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Text(
-                            text = "Authentication Required: Please reconnect destination.",
-                            style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
-                            color = MaterialTheme.colorScheme.onErrorContainer
-                        )
-                    }
-                }
-            } else if (backupSettings.lastFailureReason != null) {
-                Spacer(modifier = Modifier.height(6.dp))
-                Text(
-                    text = "Last attempt issue: ${backupSettings.lastFailureReason}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error
-                )
-            }
-
-            Spacer(modifier = Modifier.height(14.dp))
-
-            // Action Buttons
-            if (!isBackupConfigured) {
-                Button(
-                    onClick = onRequestConnectBackup,
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Connect Cloud Destination")
-                }
-            } else {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedButton(
-                        onClick = onTriggerBackupNow,
-                        shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("Back Up Now")
-                    }
-
-                    TextButton(
-                        onClick = onRequestDisconnectBackup,
-                        colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
-                    ) {
-                        Text("Disconnect")
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
 private fun ConnectBackupDialog(
     isTesting: Boolean,
     onDismiss: () -> Unit,
@@ -884,6 +701,7 @@ private fun ConnectBackupDialog(
                     value = token,
                     onValueChange = { token = it },
                     label = { Text("Bearer Token / API Key (Optional)") },
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )

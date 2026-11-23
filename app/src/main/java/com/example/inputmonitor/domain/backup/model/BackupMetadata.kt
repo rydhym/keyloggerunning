@@ -7,5 +7,6 @@ data class BackupMetadata(
     val fileName: String,
     val fileSize: Long,
     val eventCount: Long,
-    val timestamp: Long = System.currentTimeMillis()
+    val timestamp: Long = System.currentTimeMillis(),
+    val backupId: String = java.util.UUID.randomUUID().toString()
 )

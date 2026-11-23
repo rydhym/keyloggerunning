@@ -23,6 +23,26 @@ import java.nio.file.Files
 
 class BackupSettingsRepositoryTest {
 
+    @Test fun backupHistoryPersistsActualMetadataAcrossRepositoryRecreation() = runBlocking {
+        val run = com.example.inputmonitor.domain.backup.model.BackupRun("manual-work",
+            stage = com.example.inputmonitor.domain.backup.model.BackupStage.SUCCESS,
+            startedAt = 100, completedAt = 200, recordCount = 58, sizeBytes = 12742, uploadSizeBytes = 12742, httpStatus = 200)
+        repository.saveBackupRun(run)
+        val recreated = BackupSettingsRepositoryImpl(object : android.content.ContextWrapper(null) {}, testDispatchers, testDataStore)
+        assertEquals(listOf(run), recreated.backupHistory.first())
+        repository.recordBackupSuccess(200, "test-id")
+        repository.recordBackupAttempt(300)
+        repository.recordBackupFailure("Backup server unavailable")
+        assertEquals(200L, recreated.getBackupSettings().lastSuccessfulBackupAt)
+        assertEquals(300L, recreated.getBackupSettings().lastAttemptAt)
+    }
+
+    @Test fun resettingSettingsAlsoDeletesHistory() = runBlocking {
+        repository.saveBackupRun(com.example.inputmonitor.domain.backup.model.BackupRun("test"))
+        repository.resetBackupSettings()
+        assertTrue(repository.backupHistory.first().isEmpty())
+    }
+
     private val testDispatcher = Dispatchers.Unconfined
     private val testDispatchers = object : DispatcherProvider {
         override val main: CoroutineDispatcher = testDispatcher

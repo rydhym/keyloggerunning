@@ -14,7 +14,8 @@ sealed class ExportResult {
     data class Success(
         val eventCount: Long,
         val bytesWritten: Long,
-        val targetUriString: String? = null
+        val targetUriString: String? = null,
+        val sessionCount: Int = 0
     ) : ExportResult()
 
     data class Error(

@@ -23,7 +23,12 @@ data class SettingsUiState(
     val backupSettings: BackupSettings = BackupSettings(),
     val showConnectBackupDialog: Boolean = false,
     val showDisconnectBackupDialog: Boolean = false,
-    val isTestingConnection: Boolean = false
+    val isTestingConnection: Boolean = false,
+    val isManualBackupRunning: Boolean = false,
+    val backupRun: com.example.inputmonitor.domain.backup.model.BackupRun = com.example.inputmonitor.domain.backup.model.BackupRun(),
+    val backupHistory: List<com.example.inputmonitor.domain.backup.model.BackupRun> = emptyList(),
+    val connectionStatus: String = "Not tested",
+    val automaticBackupRun: com.example.inputmonitor.domain.backup.model.BackupRun? = null
 ) {
     val isBackupConfigured: Boolean
         get() = backupSettings.isConfigured

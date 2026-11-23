@@ -18,7 +18,8 @@ sealed class BackupFileResult {
     data class Success(
         val file: File,
         val eventCount: Long,
-        val bytesWritten: Long
+        val bytesWritten: Long,
+        val sessionCount: Int = 0
     ) : BackupFileResult()
 
     data class Error(
@@ -55,7 +56,7 @@ class BackupFileManager(
      * Incomplete files are deleted on failure.
      */
     suspend fun createBackupFile(sessionId: String? = null): BackupFileResult = withContext(dispatchers.io) {
-        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val timestamp = java.util.UUID.randomUUID().toString()
         val cleanScope = (sessionId ?: "all_sessions").replace("[^a-zA-Z0-9_-]".toRegex(), "_")
         val finalFileName = "backup_${cleanScope}_$timestamp.csv"
         val tempFileName = "$finalFileName.tmp"
@@ -83,7 +84,8 @@ class BackupFileManager(
                         BackupFileResult.Success(
                             file = finalFile,
                             eventCount = res.eventCount,
-                            bytesWritten = res.bytesWritten
+                            bytesWritten = finalFile.length(),
+                            sessionCount = res.sessionCount
                         )
                     } else {
                         // Fallback copy & delete
@@ -92,7 +94,8 @@ class BackupFileManager(
                         BackupFileResult.Success(
                             file = finalFile,
                             eventCount = res.eventCount,
-                            bytesWritten = res.bytesWritten
+                            bytesWritten = finalFile.length(),
+                            sessionCount = res.sessionCount
                         )
                     }
                 }
@@ -107,10 +110,28 @@ class BackupFileManager(
                     BackupFileResult.Error("Export resulted in null state")
                 }
             }
+        } catch (t: kotlinx.coroutines.CancellationException) {
+            deleteFileQuietly(tempFile)
+            deleteFileQuietly(finalFile)
+            throw t
         } catch (t: Throwable) {
             deleteFileQuietly(tempFile)
             deleteFileQuietly(finalFile)
             BackupFileResult.Error(t.message ?: "Failed to generate backup file", t)
+        }
+    }
+
+    /** Synthetic fixture, deliberately independent of the event/session repositories. */
+    suspend fun createTestBackupFile(): BackupFileResult = withContext(dispatchers.io) {
+        val file = File(backupDir, "test_${java.util.UUID.randomUUID()}.csv")
+        try {
+            val csv = "test,status,timestamp\r\nInputMonitor,OK,${java.time.Instant.now()}\r\n"
+            file.writeBytes(csv.toByteArray(Charsets.UTF_8))
+            BackupFileResult.Success(file, 1, file.length(), 0)
+        } catch (t: Exception) {
+            deleteFileQuietly(file)
+            if (t is kotlinx.coroutines.CancellationException) throw t
+            BackupFileResult.Error("Could not prepare test backup", t)
         }
     }
 

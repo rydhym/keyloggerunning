@@ -28,6 +28,34 @@ import java.nio.file.Files
 
 class BackupFileManagerTest {
 
+    @Test fun utf8FileSizeIsActualBytesAndCountsExportedSessions() = runBlocking {
+        listOf("session-one", "session-two").forEach { id ->
+            repository.insertEvent(InteractionEvent(sessionId = id, timestamp = 1000,
+                source = EventSource.KEYBOARD, eventType = EventType.TEXT_COMMITTED,
+                packageName = "com.example.test", applicationName = "Test", eventData = "\u00e9\u4e2d\ud83d\ude42",
+                inputClassification = InputClassification.NORMAL_TEXT))
+        }
+        val result = backupFileManager.createBackupFile() as BackupFileResult.Success
+        val text = result.file.readText(Charsets.UTF_8)
+        assertEquals(text.toByteArray(Charsets.UTF_8).size.toLong(), result.bytesWritten)
+        assertTrue(result.bytesWritten > text.length.toLong())
+        assertEquals(2, result.sessionCount)
+        assertEquals(2L, result.eventCount)
+    }
+
+    @Test fun syntheticFixtureDoesNotReadRealRecords() = runBlocking {
+        repository.insertEvent(InteractionEvent(sessionId = "private-session", timestamp = 1000,
+            source = EventSource.KEYBOARD, eventType = EventType.TEXT_COMMITTED,
+            packageName = null, applicationName = null, eventData = "not-for-test-upload",
+            inputClassification = InputClassification.NORMAL_TEXT))
+        val result = backupFileManager.createTestBackupFile() as BackupFileResult.Success
+        val csv = result.file.readText(Charsets.UTF_8)
+        assertTrue(csv.startsWith("test,status,timestamp\r\nInputMonitor,OK,"))
+        assertFalse(csv.contains("private-session")); assertFalse(csv.contains("not-for-test-upload"))
+        assertEquals(result.file.length(), result.bytesWritten)
+        assertEquals(0, result.sessionCount)
+    }
+
     private val testDispatcher = Dispatchers.Unconfined
     private val testDispatchers = object : DispatcherProvider {
         override val main: CoroutineDispatcher = testDispatcher
